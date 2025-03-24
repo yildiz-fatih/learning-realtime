@@ -18,22 +18,53 @@ public class MessagesController : ControllerBase
     [HttpGet]
     public async Task<ActionResult<List<Message>>> GetAll([FromQuery] DateTime? lastReceived)
     {
-        var startTime = DateTime.UtcNow;
-        var checkInterval = TimeSpan.FromMilliseconds(500);
-        var timeOut = TimeSpan.FromSeconds(30);
+        // If there is a new message, return it immediately
+        var messages = _store.GetAll();
+        var lastTime = lastReceived ?? DateTime.MinValue;
 
-        while (DateTime.UtcNow - startTime < timeOut)
+        if (messages.Last().Time > lastTime)
         {
-            if ((lastReceived ?? DateTime.MinValue) < _store.GetAll().Last().Time)
+            return Ok(GetMessagesInOrder(messages));
+        }
+        
+        // TaskCompletionSource will complete when a new message is added
+        var tcs = new TaskCompletionSource<bool>();
+        
+        // This event handler will be called when a new message is added to the store
+        void OnMessageAdded(Message newMessage)
+        {
+            if (newMessage.Time > lastTime)
             {
-                return GetMessagesInOrder(_store.GetAll());
-                // return new Random().Next(0, 2) > 0.5 ? Ok(GetMessagesInOrder(_store.GetAll())) : (StatusCode(500, "An unexpected error occurred."));
+                tcs.TrySetResult(true);
             }
-            
-            await Task.Delay(checkInterval);
         }
 
-        return NoContent();
+        try
+        {
+            // Subscribe to the MessageAdded event
+            _store.MessageAdded += OnMessageAdded;
+            
+            // We asynchronously wait here until:
+            //   -> a new message arrives and triggers OnMessageAdded (and therefore completes the task), or
+            //   -> 30 seconds pass, whichever happens first
+            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(30));
+            var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
+
+            // In case of timeout, return 204 NoContent
+            if (completedTask == timeoutTask)
+            {
+                return NoContent();
+            }
+
+            // In case a new message arrives within 30 seconds
+            messages = _store.GetAll();
+            return Ok(GetMessagesInOrder(messages));
+        }
+        finally
+        {
+            // Unsubscribe from the event
+            _store.MessageAdded -= OnMessageAdded;
+        }
     }
 
     private List<Message> GetMessagesInOrder(List<Message> messages)
